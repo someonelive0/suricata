@@ -433,6 +433,9 @@ void EveHttpLogJSONBodyBase64(JsonBuilder *js, Flow *f, uint64_t tx_id)
     }
 }
 
+// WARN include output-json-http-zh.c, for BodyPrintableBufferZh()
+#include "output-json-http-zh.c"
+
 /* JSON format logging */
 static void EveHttpLogJSON(JsonHttpLogThread *aft, JsonBuilder *js, htp_tx_t *tx, uint64_t tx_id)
 {
@@ -446,6 +449,15 @@ static void EveHttpLogJSON(JsonHttpLogThread *aft, JsonBuilder *js, htp_tx_t *tx
         EveHttpLogJSONHeaders(js, LOG_HTTP_REQ_HEADERS, tx, http_ctx);
     if (http_ctx->flags & LOG_HTTP_RES_HEADERS || http_ctx->fields != 0)
         EveHttpLogJSONHeaders(js, LOG_HTTP_RES_HEADERS, tx, http_ctx);
+
+    // WARN, Add http body of request and response. 加入下面7行代码
+    if (tx) {
+        HtpTxUserData *htud = (HtpTxUserData *)htp_tx_get_user_data(tx);
+        if (htud != NULL) {
+            BodyPrintableBufferZh(js, &htud->request_body, "http_request_body");
+            BodyPrintableBufferZh(js, &htud->response_body, "http_response_body");
+        }
+    }
 
     jb_close(js);
 }

@@ -423,6 +423,20 @@ TmEcode ReceivePfringLoop(ThreadVars *tv, void *data, void *slot)
                 SCReturnInt(TM_ECODE_FAILED);
             }
 
+            // WARN, Make more packet for test
+            // loop 20 means 20G+1G for one net interface.
+            // loop 50 means 50G+1G for one net interface.
+            // {
+            // Packet *tmpp = NULL;
+            // for (int i=0; i<20; i++) {
+            //     tmpp = PacketGetFromQueueOrAlloc();
+            //     PKT_SET_SRC(tmpp, PKT_SRC_WIRE);
+            //     PfringProcessPacket(ptv, &hdr, tmpp);
+            //     TmThreadsSlotProcessPkt(ptv->tv, ptv->slot, tmpp);
+            // }
+            // // printf("----> add more packets\n");
+            // }
+
             /* Trigger one dump of stats every second */
             if (SCTIME_CMP_NEQ(p->ts, last_dump)) {
                 PfringDumpCounters(ptv);
