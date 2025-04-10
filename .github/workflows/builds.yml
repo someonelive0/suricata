@@ -7,6 +7,10 @@ on:
       # modified.
       - "doc/**"
   pull_request:
+    paths-ignore:
+      # Don't run this workflow if only files under doc/ have been
+      # modified.
+      - "doc/**"
   workflow_dispatch:
     inputs:
       LIBHTP_REPO:
@@ -34,7 +38,7 @@ env:
   # A recent version of stable Rust that is known to pass build, test and other
   # verification steps in this workflow. This was added because using "stable"
   # could cause some steps to fail.
-  RUST_VERSION_KNOWN: "1.70.0"
+  RUST_VERSION_KNOWN: "1.85.1"
 
 jobs:
 
@@ -582,10 +586,10 @@ jobs:
       - run: make clean
       - run: make -j ${{ env.CPUS }}
 
-  fedora-39-sv-codecov:
-    name: Fedora 39 (Suricata Verify codecov)
+  fedora-41-sv-codecov:
+    name: Fedora 41 (Suricata Verify codecov)
     runs-on: ubuntu-latest
-    container: fedora:39
+    container: fedora:41
     needs: [prepare-deps, prepare-cbindgen]
     steps:
 
@@ -646,7 +650,7 @@ jobs:
                 zlib-devel
       # packaged Rust version has no profiler support built in, so get from rustup
       - name: Install Rust
-        run: curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain 1.63.0 -y
+        run: curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain 1.83 -y
       - run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871
       - uses: ./.github/actions/install-cbindgen
@@ -680,11 +684,11 @@ jobs:
           fail_ci_if_error: false
           flags: suricata-verify
 
-  # Fedora 39 build using Clang.
-  fedora-39-clang:
-    name: Fedora 39 (clang, debug, asan, wshadow, rust-strict, systemd)
+  # Fedora 41 build using Clang.
+  fedora-41-clang:
+    name: Fedora 41 (clang, debug, asan, wshadow, rust-strict, systemd)
     runs-on: ubuntu-latest
-    container: fedora:39
+    container: fedora:41
     needs: [prepare-deps, prepare-cbindgen]
     steps:
 
@@ -789,10 +793,10 @@ jobs:
       - run: ldd src/suricata | grep libsystemd &> /dev/null
 
   # Fedora 39 build using GCC.
-  fedora-39-gcc:
-    name: Fedora 39 (gcc, debug, asan, wshadow, rust-strict)
+  fedora-41-gcc:
+    name: Fedora 41 (gcc, debug, asan, wshadow, rust-strict)
     runs-on: ubuntu-latest
-    container: fedora:39
+    container: fedora:41
     needs: [prepare-deps, prepare-cbindgen]
     steps:
 
@@ -880,209 +884,13 @@ jobs:
       - run: suricata-update -V
       - run: suricatasc -h
 
-  # Fedora 40 build using Clang.
-  fedora-40-clang:
-    name: Fedora 40 (clang, debug, asan, wshadow, rust-strict, systemd)
-    runs-on: ubuntu-latest
-    container: fedora:40
-    needs: [prepare-deps, prepare-cbindgen]
-    steps:
-
-      # Cache Rust stuff.
-      - name: Cache cargo registry
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
-        with:
-          path: ~/.cargo/registry
-          key: cargo-registry
-
-      - name: Cache RPMs
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
-        with:
-          path: /var/cache/dnf
-          key: ${{ github.job }}-dnf
-      - run: echo "keepcache=1" >> /etc/dnf/dnf.conf
-
-      - name: Determine number of CPUs
-        run: echo CPUS=$(nproc --all) >> $GITHUB_ENV
-
-      - run: |
-          dnf -y install \
-                autoconf \
-                automake \
-                cargo \
-                cbindgen \
-                ccache \
-                clang \
-                diffutils \
-                file-devel \
-                gcc \
-                gcc-c++ \
-                git \
-                hiredis-devel \
-                jansson-devel \
-                jq \
-                lua-devel \
-                libasan \
-                libtool \
-                libyaml-devel \
-                libnfnetlink-devel \
-                libnetfilter_queue-devel \
-                libnet-devel \
-                libcap-ng-devel \
-                libevent-devel \
-                libmaxminddb-devel \
-                libpcap-devel \
-                libxdp-devel \
-                libbpf-devel \
-                libtool \
-                lz4-devel \
-                make \
-                nss-softokn-devel \
-                pcre2-devel \
-                pkgconfig \
-                python3-yaml \
-                sudo \
-                systemd-devel \
-                which \
-                zlib-devel
-      - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871
-      - run: git config --global --add safe.directory /__w/suricata/suricata
-      - uses: ./.github/actions/install-cbindgen
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
-        with:
-          name: prep
-          path: prep
-      - run: tar xf prep/libhtp.tar.gz
-      - run: tar xf prep/suricata-update.tar.gz
-      - run: ./autogen.sh
-      - run: CC="clang" CFLAGS="$DEFAULT_CFLAGS -Wshadow -fsanitize=address -fno-omit-frame-pointer" ./configure --enable-debug --enable-unittests --disable-shared --enable-rust-strict --enable-hiredis --enable-nfqueue --enable-lua
-        env:
-          LDFLAGS: "-fsanitize=address"
-          ac_cv_func_realloc_0_nonnull: "yes"
-          ac_cv_func_malloc_0_nonnull: "yes"
-      - run: make -j ${{ env.CPUS }}
-      - run: ASAN_OPTIONS="detect_leaks=0" ./src/suricata -u -l .
-      - name: Extracting suricata-verify
-        run: tar xf prep/suricata-verify.tar.gz
-      - name: Running suricata-verify
-        run: python3 ./suricata-verify/run.py -q --debug-failed
-      # Now install and make sure headers and libraries aren't install
-      # until requested.
-      - run: make install
-      - run: test ! -e /usr/local/lib/libsuricata_c.a
-      - run: test ! -e /usr/local/include/suricata
-      - run: make install-headers
-      - run: test -e /usr/local/include/suricata/suricata.h
-      - run: make install-library
-      - run: test -e /usr/local/lib/libsuricata_c.a
-      - run: test -e /usr/local/lib/libsuricata_rust.a
-      - run: test -e /usr/local/bin/libsuricata-config
-      - run: test ! -e /usr/local/lib/libsuricata.so
-      - run: make install
-      - run: suricata-update -V
-      - run: suricatasc -h
-      # Check compilation against systemd
-      - run: ldd src/suricata | grep libsystemd &> /dev/null
-
-  # Fedora 40 build using GCC.
-  fedora-40-gcc:
-    name: Fedora 40 (gcc, debug, asan, wshadow, rust-strict)
-    runs-on: ubuntu-latest
-    container: fedora:40
-    needs: [prepare-deps, prepare-cbindgen]
-    steps:
-
-      # Cache Rust stuff.
-      - name: Cache cargo registry
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
-        with:
-          path: ~/.cargo/registry
-          key: cargo-registry
-
-      - name: Determine number of CPUs
-        run: echo CPUS=$(nproc --all) >> $GITHUB_ENV
-
-      - run: |
-          dnf -y install \
-                autoconf \
-                automake \
-                cargo \
-                cbindgen \
-                ccache \
-                diffutils \
-                file-devel \
-                gcc \
-                gcc-c++ \
-                git \
-                hiredis-devel \
-                jansson-devel \
-                jq \
-                lua-devel \
-                libasan \
-                libtool \
-                libyaml-devel \
-                libnfnetlink-devel \
-                libnetfilter_queue-devel \
-                libnet-devel \
-                libcap-ng-devel \
-                libevent-devel \
-                libmaxminddb-devel \
-                libpcap-devel \
-                libtool \
-                lz4-devel \
-                make \
-                nss-softokn-devel \
-                pcre2-devel \
-                pkgconfig \
-                python3-yaml \
-                sudo \
-                which \
-                zlib-devel
-      - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871
-      - uses: ./.github/actions/install-cbindgen
-      - run: git config --global --add safe.directory /__w/suricata/suricata
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
-        with:
-          name: prep
-          path: prep
-      - run: tar xf prep/libhtp.tar.gz
-      - run: tar xf prep/suricata-update.tar.gz
-      - run: ./autogen.sh
-      - run: ./configure --enable-debug --enable-unittests --disable-shared --enable-rust-strict --enable-hiredis --enable-nfqueue
-        env:
-          CFLAGS: "${{ env.DEFAULT_CFLAGS }} -Wshadow -fsanitize=address -fno-omit-frame-pointer"
-          LDFLAGS: "-fsanitize=address"
-          ac_cv_func_realloc_0_nonnull: "yes"
-          ac_cv_func_malloc_0_nonnull: "yes"
-      - run: make -j ${{ env.CPUS }}
-      - run: ASAN_OPTIONS="detect_leaks=0" ./src/suricata -u -l .
-      - name: Extracting suricata-verify
-        run: tar xf prep/suricata-verify.tar.gz
-      - name: Running suricata-verify
-        run: python3 ./suricata-verify/run.py -q --debug-failed
-      # Now install and make sure headers and libraries aren't install
-      # until requested.
-      - run: make install
-      - run: test ! -e /usr/local/lib/libsuricata_c.a
-      - run: test ! -e /usr/local/include/suricata
-      - run: make install-headers
-      - run: test -e /usr/local/include/suricata/suricata.h
-      - run: make install-library
-      - run: test -e /usr/local/lib/libsuricata_c.a
-      - run: test -e /usr/local/lib/libsuricata_rust.a
-      - run: test -e /usr/local/bin/libsuricata-config
-      - run: test ! -e /usr/local/lib/libsuricata.so
-      - run: make install
-      - run: suricata-update -V
-      - run: suricatasc -h
-
   # This job builds and tests Suricata as a non-root user as some
   # issues only show up when not running as root, and by default all
   # jobs in GitHub actions are run as root inside the container.
-  fedora-40-non-root:
-    name: Fedora 40 (non-root, debug, clang, asan, wshadow, rust-strict)
+  fedora-non-root:
+    name: Fedora (non-root, debug, clang, asan, wshadow, rust-strict)
     runs-on: ubuntu-latest
-    container: fedora:40
+    container: fedora:41
     needs: [prepare-deps, prepare-cbindgen]
     steps:
       - name: Determine number of CPUs
