@@ -17,6 +17,7 @@
 
 //! Application layer mysql parser and logger module.
 
+pub mod detect;
 pub mod logger;
-mod parser;
+pub mod parser;
 pub mod mysql;

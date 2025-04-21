@@ -1,4 +1,4 @@
-/* Copyright (C) 2025 Open Information Security Foundation
+/* Copyright (C) 2024 Open Information Security Foundation
  *
  * You can copy, redistribute or modify this Program under the terms of
  * the GNU General Public License version 2 as published by the Free
@@ -15,24 +15,45 @@
  * 02110-1301, USA.
  */
 
-use super::mysql::MysqlTransaction;
+// Author: QianKaiLin <linqiankai666@outlook.com>
+
 use crate::jsonbuilder::{JsonBuilder, JsonError};
-use std;
+use crate::applayermysql::mysql::*;
 
 fn log_mysql(tx: &MysqlTransaction, js: &mut JsonBuilder) -> Result<(), JsonError> {
-    if let Some(ref request) = tx.request {
-        js.set_string("request", request)?;
+    js.open_object("mysql")?;
+    js.set_string("version", tx.version.as_str())?;
+    js.set_bool("tls", tx.tls)?;
+
+    if let Some(command) = &tx.command {
+        js.set_string("command", command)?;
     }
-    if let Some(ref response) = tx.response {
-        js.set_string("response", response)?;
+
+    if let Some(affected_rows) = tx.affected_rows {
+        js.set_uint("affected_rows", affected_rows)?;
     }
+
+    if let Some(rows) = &tx.rows {
+        js.open_array("rows")?;
+        for row in rows {
+            js.append_string(row)?;
+        }
+        js.close()?;
+    }
+
+    js.close()?;
+
     Ok(())
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn rs_mysql_logger_log(
+pub unsafe extern "C" fn SCMysqlLogger(
     tx: *mut std::os::raw::c_void, js: &mut JsonBuilder,
 ) -> bool {
-    let tx = cast_pointer!(tx, MysqlTransaction);
-    log_mysql(tx, js).is_ok()
+    let tx_mysql = cast_pointer!(tx, MysqlTransaction);
+    let result = log_mysql(tx_mysql, js);
+    if let Err(ref _err) = result {
+        return false;
+    }
+    return result.is_ok();
 }

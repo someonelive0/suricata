@@ -1,4 +1,4 @@
-/* Copyright (C) 2025 Open Information Security Foundation
+/* Copyright (C) 2024 Open Information Security Foundation
  *
  * You can copy, redistribute or modify this Program under the terms of
  * the GNU General Public License version 2 as published by the Free
@@ -15,48 +15,46 @@
  * 02110-1301, USA.
  */
 
-use super::parser;
-use crate::applayer::{self, *};
-use crate::conf::conf_get;
-use crate::core::{AppProto, Flow, ALPROTO_UNKNOWN, IPPROTO_TCP};
-use nom7 as nom;
-use std;
+// Author: QianKaiLin <linqiankai666@outlook.com>
+//
 use std::collections::VecDeque;
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_void};
 
-static mut MYSQL_MAX_TX: usize = 256;
+use nom7::IResult;
 
-static mut ALPROTO_MYSQL: AppProto = ALPROTO_UNKNOWN;
+use crate::applayer::*;
+use crate::conf::{conf_get, get_memval};
+use crate::core::*;
 
-#[derive(AppLayerEvent)]
-enum MysqlEvent {
+use super::parser::*;
+
+pub const MYSQL_CONFIG_DEFAULT_STREAM_DEPTH: u32 = 0;
+
+static mut MYSQL_MAX_TX: usize = 1024;
+
+pub static mut ALPROTO_MYSQL: AppProto = ALPROTO_UNKNOWN;
+
+#[derive(FromPrimitive, Debug, AppLayerEvent)]
+pub enum MysqlEvent {
     TooManyTransactions,
 }
 
+#[derive(Debug)]
 pub struct MysqlTransaction {
-    tx_id: u64,
-    pub request: Option<String>,
-    pub response: Option<String>,
+    pub tx_id: u64,
 
-    tx_data: AppLayerTxData,
-}
+    /// Required
+    pub version: String,
+    /// Optional when tls is true
+    pub command: Option<String>,
+    /// Optional when tls is true
+    pub affected_rows: Option<u64>,
+    /// Optional when tls is true
+    pub rows: Option<Vec<String>>,
+    pub tls: bool,
 
-impl Default for MysqlTransaction {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MysqlTransaction {
-    pub fn new() -> MysqlTransaction {
-        Self {
-            tx_id: 0,
-            request: None,
-            response: None,
-            tx_data: AppLayerTxData::new(),
-        }
-    }
+    pub complete: bool,
+    pub tx_data: AppLayerTxData,
 }
 
 impl Transaction for MysqlTransaction {
@@ -65,13 +63,186 @@ impl Transaction for MysqlTransaction {
     }
 }
 
-#[derive(Default)]
+impl MysqlTransaction {
+    pub fn new(version: String) -> Self {
+        Self {
+            tx_id: 0,
+            version,
+            command: None,
+            affected_rows: None,
+            tls: false,
+            tx_data: AppLayerTxData::new(),
+            complete: false,
+            rows: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MysqlStateProgress {
+    // Default State
+    Init,
+
+    // Connection Phase
+    // Server send HandshakeRequest to Client
+    // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html
+    Handshake,
+    // Client send HandshakeResponse to Server
+    // Server send AuthSwitchRequest to Client
+    Auth,
+    // Server send OkResponse to Client
+    AuthFinished,
+
+    // Command Phase
+    // Client send QueryRequest to Server
+    CommandReceived,
+    // Server send EOF with 0x0A to Client
+    TextResulsetContinue,
+    // Server send QueryResponse to Client or Ok to Client
+    CommandResponseReceived,
+    // Server send LocalFileRequest with zero length to Client
+    LocalFileRequestReceived,
+    // Client send empty packet to Server
+    LocalFileContentFinished,
+    // Client send StatisticsRequest to Server
+    StatisticsReceived,
+    // Server send StatisticsResponse to client
+    StatisticsResponseReceived,
+    // Client send FieldList to Server
+    FieldListReceived,
+    // Server send FieldListResponse to client
+    FieldListResponseReceived,
+    // Client send ChangeUserRequest to Server
+    ChangeUserReceived,
+    // Server send OkResponse to client
+    ChangeUserResponseReceived,
+    // Client send Unknown to Server
+    UnknownCommandReceived,
+    // Client send StmtPrepareRequest to Server
+    StmtPrepareReceived,
+    // Server send StmtPrepareResponse to Client
+    StmtPrepareResponseReceived,
+    // Client send StmtExecRequest to Server
+    StmtExecReceived,
+    // Server send StmtExecResponse with EOF status equal 0x0a to Client
+    StmtExecResponseContinue,
+    // Server send ResultSetResponse to Client or Ok Response to Client
+    StmtExecResponseReceived,
+    // Client send StmtFetchRequest to Server
+    StmtFetchReceived,
+    // Server send StmtFetchResponse with EOF status equal 0x0a to Client
+    StmtFetchResponseContinue,
+    // Server send StmtFetchResponse to Client
+    StmtFetchResponseReceived,
+    // Client send StmtFetchRequest to Server
+    StmtResetReceived,
+    // Server send Ok or Err Response to Client
+    StmtResetResponseReceived,
+    // Client send StmtCloseRequest to Server
+    StmtCloseReceived,
+
+    // Client send QueryRequest and command equal Quit to Server
+    // Client send ChangeUserRequest to server and server send ErrResponse to Client
+    // Transport Layer EOF
+    // Transport Layer Upgrade to TLS
+    Finished,
+}
+
+#[derive(Debug)]
+struct MysqlStatement {
+    statement_id: Option<u32>,
+    prepare_stmt: String,
+    param_cnt: Option<u16>,
+    param_types: Option<Vec<MysqlColumnDefinition>>,
+    stmt_long_datas: Option<Vec<StmtLongData>>,
+    rows: Option<Vec<MysqlResultBinarySetRow>>,
+}
+
+impl MysqlStatement {
+    fn new(prepare_stmt: String) -> Self {
+        MysqlStatement {
+            statement_id: None,
+            prepare_stmt,
+            param_cnt: None,
+            param_types: None,
+            stmt_long_datas: None,
+            rows: None,
+        }
+    }
+
+    fn set_statement_id(&mut self, statement_id: u32) {
+        self.statement_id = Some(statement_id);
+    }
+
+    fn set_param_cnt(&mut self, param_cnt: u16) {
+        self.param_cnt = Some(param_cnt);
+    }
+
+    fn set_param_types(&mut self, cols: Vec<MysqlColumnDefinition>) {
+        self.param_types = Some(cols);
+    }
+
+    fn add_stmt_long_datas(&mut self, long_data: StmtLongData) {
+        if let Some(stmt_long_datas) = &mut self.stmt_long_datas {
+            stmt_long_datas.push(long_data);
+        } else {
+            self.stmt_long_datas = Some(vec![long_data]);
+        }
+    }
+
+    fn reset_stmt_long_datas(&mut self) {
+        self.stmt_long_datas.take();
+    }
+
+    fn add_rows(&mut self, rows: Vec<MysqlResultBinarySetRow>) {
+        if let Some(old_rows) = &mut self.rows {
+            old_rows.extend(rows);
+        } else {
+            self.rows = Some(rows);
+        }
+    }
+
+    fn execute(&self, params: Vec<String>) -> Option<String> {
+        let prepare_stmt = self.prepare_stmt.clone();
+        let mut query = String::new();
+        if !params.is_empty()
+            && self.param_cnt.is_some()
+            && self.param_cnt.unwrap() as usize == params.len()
+        {
+            let mut params = params.iter();
+            for part in prepare_stmt.split('?') {
+                query.push_str(part);
+                if let Some(param) = params.next() {
+                    query.push_str(param);
+                }
+            }
+            Some(query)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct MysqlState {
-    state_data: AppLayerStateData,
-    tx_id: u64,
+    pub state_data: AppLayerStateData,
+    pub tx_id: u64,
     transactions: VecDeque<MysqlTransaction>,
     request_gap: bool,
     response_gap: bool,
+    state_progress: MysqlStateProgress,
+    tx_index_completed: usize,
+
+    client_flags: u32,
+    server_flags: u32,
+    version: Option<String>,
+    tls: bool,
+    /// stmt prepare
+    prepare_stmt: Option<MysqlStatement>,
+    /// If None: not compressed, else if Some(true): zstd, else: zlib
+    zstd: Option<bool>,
+    /// AuthFinished state
+    handshake_done: bool,
 }
 
 impl State<MysqlTransaction> for MysqlState {
@@ -84,13 +255,35 @@ impl State<MysqlTransaction> for MysqlState {
     }
 }
 
+impl Default for MysqlState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MysqlState {
     pub fn new() -> Self {
-        Default::default()
+        let state = Self {
+            state_data: AppLayerStateData::new(),
+            tx_id: 0,
+            transactions: VecDeque::new(),
+            request_gap: false,
+            response_gap: false,
+            state_progress: MysqlStateProgress::Init,
+            tx_index_completed: 0,
+
+            client_flags: 0,
+            server_flags: 0,
+            version: None,
+            tls: false,
+            prepare_stmt: None,
+            zstd: None,
+            handshake_done: false,
+        };
+        state
     }
 
-    // Free a transaction by ID.
-    fn free_tx(&mut self, tx_id: u64) {
+    pub fn free_tx(&mut self, tx_id: u64) {
         let len = self.transactions.len();
         let mut found = false;
         let mut index = 0;
@@ -103,6 +296,7 @@ impl MysqlState {
             }
         }
         if found {
+            self.tx_index_completed = 0;
             self.transactions.remove(index);
         }
     }
@@ -111,219 +305,985 @@ impl MysqlState {
         self.transactions.iter().find(|tx| tx.tx_id == tx_id + 1)
     }
 
-    fn new_tx(&mut self) -> MysqlTransaction {
-        let mut tx = MysqlTransaction::new();
+    fn get_tx_mut(&mut self, tx_id: u64) -> Option<&mut MysqlTransaction> {
+        self.transactions
+            .iter_mut()
+            .find(|tx| tx.tx_id == tx_id + 1)
+    }
+
+    fn set_event(tx: &mut MysqlTransaction, event: MysqlEvent) {
+        tx.tx_data.set_event(event as u8);
+    }
+
+    fn is_compressed(&self) -> bool {
+        self.zstd.is_some() && self.handshake_done
+    }
+
+    fn new_tx(&mut self, command: String) -> MysqlTransaction {
+        let mut tx = MysqlTransaction::new(self.version.clone().unwrap_or_default());
         self.tx_id += 1;
         tx.tx_id = self.tx_id;
-        return tx;
+        tx.tls = self.tls;
+        if tx.tls {
+            tx.complete = true;
+        }
+        tx.command = Some(command);
+        SCLogDebug!("Creating new transaction.tx_id: {}", tx.tx_id);
+        if self.transactions.len() > unsafe { MYSQL_MAX_TX } + self.tx_index_completed {
+            let mut index = self.tx_index_completed;
+            for tx_old in &mut self.transactions.range_mut(self.tx_index_completed..) {
+                index += 1;
+                if !tx_old.complete {
+                    tx_old.complete = true;
+                    MysqlState::set_event(tx_old, MysqlEvent::TooManyTransactions);
+                    break;
+                }
+            }
+            self.tx_index_completed = index;
+        }
+        tx
     }
 
-    fn find_request(&mut self) -> Option<&mut MysqlTransaction> {
-        self.transactions.iter_mut().find(|tx| tx.response.is_none())
+    /// Find or create a new transaction
+    ///
+    /// If a new transaction is created, push that into state.transactions before returning &mut to last tx
+    /// If we can't find a transaction and we should not create one, we return None
+    /// The moment when this is called will may impact the logic of transaction tracking (e.g. when a tx is considered completed)
+    fn create_tx(&mut self, command: String) -> Option<&mut MysqlTransaction> {
+        let tx = self.new_tx(command);
+        SCLogDebug!("create state is {:?}", &self.state_progress);
+        self.transactions.push_back(tx);
+        self.transactions.back_mut()
     }
 
-    fn parse_request(&mut self, input: &[u8]) -> AppLayerResult {
+    fn request_next_state(
+        &mut self, request: MysqlFEMessage, f: *const Flow,
+    ) -> Option<MysqlStateProgress> {
+        match request {
+            MysqlFEMessage::HandshakeResponse(resp) => {
+                if resp.client_flags & CLIENT_OPTIONAL_RESULTSET_METADATA != 0 {
+                    return Some(MysqlStateProgress::Finished);
+                }
+                self.client_flags = resp.client_flags;
+                if resp.zstd_compression_level.is_some() {
+                    self.zstd = Some(true);
+                } else if self.server_flags & CLIENT_COMPRESS != 0
+                    && self.client_flags & CLIENT_COMPRESS != 0
+                {
+                    self.zstd = Some(false);
+                }
+
+                Some(MysqlStateProgress::Auth)
+            }
+            MysqlFEMessage::SSLRequest(_) => {
+                unsafe {
+                    AppLayerRequestProtocolTLSUpgrade(f);
+                }
+                self.tls = true;
+                self.create_tx("".to_string());
+                Some(MysqlStateProgress::Finished)
+            }
+            MysqlFEMessage::AuthRequest => None,
+            MysqlFEMessage::LocalFileData(length) => {
+                if length == 0 {
+                    let tx = self.get_tx_mut(self.tx_id - 1);
+                    if let Some(tx) = tx {
+                        tx.complete = true;
+                    }
+                    return Some(MysqlStateProgress::LocalFileContentFinished);
+                }
+                None
+            }
+            MysqlFEMessage::Request(req) => match req.command {
+                MysqlCommand::Query { query: _ } => {
+                    self.create_tx(req.command.to_string());
+                    return Some(MysqlStateProgress::CommandReceived);
+                }
+                MysqlCommand::StmtPrepare { query } => {
+                    self.prepare_stmt = Some(MysqlStatement::new(query));
+                    return Some(MysqlStateProgress::StmtPrepareReceived);
+                }
+
+                MysqlCommand::StmtExecute {
+                    statement_id: expected_statement_id,
+                    params,
+                } => {
+                    if let Some(prepare_stmt) = &self.prepare_stmt {
+                        if let Some(statement_id) = prepare_stmt.statement_id {
+                            if statement_id == expected_statement_id {
+                                let command = prepare_stmt.execute(params.unwrap_or_default());
+                                self.create_tx(command.unwrap_or_default());
+                            } else {
+                                SCLogWarning!(
+                                    "Receive stmt exec statement_id {} not equal we need {}",
+                                    expected_statement_id,
+                                    statement_id
+                                );
+                                return Some(MysqlStateProgress::Finished);
+                            }
+                        }
+                    } else {
+                        return Some(MysqlStateProgress::Finished);
+                    }
+                    return Some(MysqlStateProgress::StmtExecReceived);
+                }
+                MysqlCommand::StmtFetch {
+                    statement_id: _,
+                    number_rows: _,
+                } => {
+                    return Some(MysqlStateProgress::StmtFetchReceived);
+                }
+                MysqlCommand::StmtSendLongData(stmt_long_data) => {
+                    if let Some(prepare_stmt) = &mut self.prepare_stmt {
+                        if let Some(statement_id) = prepare_stmt.statement_id {
+                            if statement_id == stmt_long_data.statement_id {
+                                prepare_stmt.add_stmt_long_datas(stmt_long_data);
+                            }
+                        }
+                    }
+                    None
+                }
+                MysqlCommand::StmtReset { statement_id } => {
+                    if let Some(prepare_stmt) = &mut self.prepare_stmt {
+                        if let Some(expected_statement_id) = prepare_stmt.statement_id {
+                            if statement_id == expected_statement_id {
+                                prepare_stmt.reset_stmt_long_datas();
+                            }
+                        }
+                    }
+                    return Some(MysqlStateProgress::StmtResetReceived);
+                }
+                MysqlCommand::StmtClose { statement_id } => {
+                    if let Some(prepare_stmt) = &self.prepare_stmt {
+                        if let Some(expected_statement_id) = prepare_stmt.statement_id {
+                            if statement_id == expected_statement_id {
+                                self.prepare_stmt.take();
+                            } else {
+                                SCLogWarning!(
+                                    "Receive stmt close statement_id {} not equal we need {}",
+                                    expected_statement_id,
+                                    statement_id
+                                );
+                            }
+                        } else {
+                            SCLogWarning!("Receive stmt close without stmt prepare response");
+                        }
+                    } else {
+                        SCLogWarning!("Receive stmt close without stmt prepare response");
+                    }
+
+                    return Some(MysqlStateProgress::StmtCloseReceived);
+                }
+                MysqlCommand::Quit => {
+                    self.create_tx(req.command.to_string());
+                    return Some(MysqlStateProgress::Finished);
+                }
+                MysqlCommand::Ping
+                | MysqlCommand::Debug
+                | MysqlCommand::ResetConnection
+                | MysqlCommand::SetOption => {
+                    self.create_tx(req.command.to_string());
+                    Some(MysqlStateProgress::CommandReceived)
+                }
+                MysqlCommand::Statistics => Some(MysqlStateProgress::StatisticsReceived),
+                MysqlCommand::FieldList { table: _ } => {
+                    self.create_tx(req.command.to_string());
+                    return Some(MysqlStateProgress::FieldListReceived);
+                }
+                MysqlCommand::ChangeUser => {
+                    self.create_tx(req.command.to_string());
+                    return Some(MysqlStateProgress::ChangeUserReceived);
+                }
+                _ => {
+                    SCLogWarning!("Unknown command {}", req.command_code);
+                    return Some(MysqlStateProgress::UnknownCommandReceived);
+                }
+            },
+        }
+    }
+
+    fn state_based_req_parsing(
+        state: MysqlStateProgress, i: &[u8], param_cnt: Option<u16>,
+        param_types: Option<Vec<MysqlColumnDefinition>>,
+        stmt_long_datas: Option<Vec<StmtLongData>>, client_flags: u32,
+    ) -> IResult<&[u8], MysqlFEMessage> {
+        match state {
+            MysqlStateProgress::Handshake => {
+                let old = i;
+                let (_, client_flags) = parse_handshake_capabilities(i)?;
+                if client_flags & CLIENT_SSL != 0 {
+                    let (i, req) = parse_handshake_ssl_request(old)?;
+                    return Ok((i, MysqlFEMessage::SSLRequest(req)));
+                }
+                let (i, req) = parse_handshake_response(old)?;
+                Ok((i, MysqlFEMessage::HandshakeResponse(req)))
+            }
+            MysqlStateProgress::Auth => {
+                let (i, _) = parse_auth_request(i)?;
+                Ok((i, MysqlFEMessage::AuthRequest))
+            }
+            MysqlStateProgress::LocalFileRequestReceived => {
+                let (i, length) = parse_local_file_data_content(i)?;
+                Ok((i, MysqlFEMessage::LocalFileData(length)))
+            }
+            _ => {
+                let (i, req) =
+                    parse_request(i, param_cnt, param_types, stmt_long_datas, client_flags)?;
+                Ok((i, MysqlFEMessage::Request(req)))
+            }
+        }
+    }
+
+    pub fn parse_request(&mut self, flow: *const Flow, i: &[u8]) -> AppLayerResult {
         // We're not interested in empty requests.
-        if input.is_empty() {
+        if i.is_empty() {
             return AppLayerResult::ok();
         }
 
         // If there was gap, check we can sync up again.
         if self.request_gap {
-            if probe(input).is_err() {
-                // The parser now needs to decide what to do as we are not in sync.
-                // For this mysql, we'll just try again next time.
+            if probe(i).is_err() {
+                SCLogDebug!("Suricata interprets there's a gap in the request");
                 return AppLayerResult::ok();
             }
 
-            // It looks like we're in sync with a message header, clear gap
-            // state and keep parsing.
+            // It looks like we're in sync with the message header
+            // clear gap state and keep parsing.
             self.request_gap = false;
         }
+        if self.state_progress == MysqlStateProgress::Finished {
+            return AppLayerResult::ok();
+        }
 
-        let mut start = input;
+        let mut start = i;
         while !start.is_empty() {
-            match parser::parse_message(start) {
-                Ok((rem, request)) => {
-                    start = rem;
+            SCLogDebug!(
+                "In 'parse_request' State Progress is: {:?}",
+                &self.state_progress
+            );
+            let mut stmt_long_datas = None;
+            let mut param_cnt = None;
+            let mut param_types = None;
+            if let Some(prepare_stmt) = &self.prepare_stmt {
+                stmt_long_datas = prepare_stmt.stmt_long_datas.clone();
+                param_cnt = prepare_stmt.param_cnt;
+                param_types = prepare_stmt.param_types.clone();
+            }
 
-                    SCLogNotice!("Request: {}", request);
-                    let mut tx = self.new_tx();
-                    tx.request = Some(request);
-                    if self.transactions.len() >= unsafe {MYSQL_MAX_TX} {
-                        tx.tx_data.set_event(MysqlEvent::TooManyTransactions as u8);
+            if self.is_compressed() {
+                let zstd = self.zstd.unwrap_or_default();
+                let (rem, i) = match parse_compressed_packet(start, zstd) {
+                    Ok((rem, decompressed_packet)) => (rem, decompressed_packet.payload),
+                    Err(nom7::Err::Incomplete(_needed)) => {
+                        let consumed = i.len() - start.len();
+                        let needed_estimation = start.len() + 1;
+                        SCLogDebug!(
+                            "Needed: {:?}, estimated needed: {:?}",
+                            _needed,
+                            needed_estimation
+                        );
+                        return AppLayerResult::incomplete(
+                            consumed as u32,
+                            needed_estimation as u32,
+                        );
                     }
-                    self.transactions.push_back(tx);
-                    if self.transactions.len() >= unsafe {MYSQL_MAX_TX} {
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL compressed packet, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err
+                        );
+                        return AppLayerResult::err();
+                    }
+                };
+                start = rem;
+
+                match MysqlState::state_based_req_parsing(
+                    self.state_progress,
+                    i.as_slice(),
+                    param_cnt,
+                    param_types,
+                    stmt_long_datas,
+                    self.client_flags,
+                ) {
+                    Ok((_, request)) => {
+                        SCLogDebug!("Request is {:?}", &request);
+                        if let Some(state) = self.request_next_state(request, flow) {
+                            self.state_progress = state;
+                        }
+                    }
+
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL compressed packet, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err
+                        );
                         return AppLayerResult::err();
                     }
                 }
-                Err(nom::Err::Incomplete(_)) => {
-                    // Not enough data. This parser doesn't give us a good indication
-                    // of how much data is missing so just ask for one more byte so the
-                    // parse is called as soon as more data is received.
-                    let consumed = input.len() - start.len();
-                    let needed = start.len() + 1;
-                    return AppLayerResult::incomplete(consumed as u32, needed as u32);
-                }
-                Err(_) => {
-                    return AppLayerResult::err();
+            } else {
+                match MysqlState::state_based_req_parsing(
+                    self.state_progress,
+                    start,
+                    param_cnt,
+                    param_types.clone(),
+                    stmt_long_datas,
+                    self.client_flags,
+                ) {
+                    Ok((rem, request)) => {
+                        SCLogDebug!("Request is {:?}", &request);
+                        start = rem;
+                        if let Some(state) = self.request_next_state(request, flow) {
+                            self.state_progress = state;
+                        }
+                    }
+                    Err(nom7::Err::Incomplete(_needed)) => {
+                        let consumed = i.len() - start.len();
+                        let needed_estimation = start.len() + 1;
+                        SCLogDebug!(
+                            "Needed: {:?}, estimated needed: {:?}",
+                            _needed,
+                            needed_estimation
+                        );
+                        return AppLayerResult::incomplete(
+                            consumed as u32,
+                            needed_estimation as u32,
+                        );
+                    }
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL request, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err
+                        );
+                        return AppLayerResult::err();
+                    }
                 }
             }
         }
 
-        // Input was fully consumed.
-        return AppLayerResult::ok();
+        // All Input was fully consumed.
+        AppLayerResult::ok()
     }
 
-    fn parse_response(&mut self, input: &[u8]) -> AppLayerResult {
+    /// When the state changes based on a specific response, there are other actions we may need to perform
+    ///
+    /// If there is data from the backend message that Suri should store separately in the State or
+    /// Transaction, that is also done here
+    fn response_next_state(&mut self, response: MysqlBEMessage) -> Option<MysqlStateProgress> {
+        match response {
+            MysqlBEMessage::HandshakeRequest(req) => {
+                self.version = Some(req.version.clone());
+                self.server_flags = req.capability_flags1 as u32;
+                Some(MysqlStateProgress::Handshake)
+            }
+
+            MysqlBEMessage::Response(resp) => match resp.item {
+                MysqlResponsePacket::LocalInFileRequest => {
+                    Some(MysqlStateProgress::LocalFileRequestReceived)
+                }
+                MysqlResponsePacket::FieldsList { columns: _ } => {
+                    let tx = if self.tx_id > 0 {
+                        self.get_tx_mut(self.tx_id - 1)
+                    } else {
+                        None
+                    };
+                    if let Some(tx) = tx {
+                        tx.complete = true;
+                    }
+                    Some(MysqlStateProgress::FieldListResponseReceived)
+                }
+                MysqlResponsePacket::Statistics => {
+                    let tx = if self.tx_id > 0 {
+                        self.get_tx_mut(self.tx_id - 1)
+                    } else {
+                        None
+                    };
+                    if let Some(tx) = tx {
+                        tx.complete = true;
+                    }
+                    Some(MysqlStateProgress::StatisticsResponseReceived)
+                }
+                MysqlResponsePacket::AuthSwithRequest => Some(MysqlStateProgress::Auth),
+                MysqlResponsePacket::AuthData => None,
+                MysqlResponsePacket::Err { .. } => match self.state_progress {
+                    MysqlStateProgress::CommandReceived
+                    | MysqlStateProgress::TextResulsetContinue => {
+                        let tx = if self.tx_id > 0 {
+                            self.get_tx_mut(self.tx_id - 1)
+                        } else {
+                            None
+                        };
+                        if let Some(tx) = tx {
+                            tx.complete = true;
+                        }
+                        Some(MysqlStateProgress::CommandResponseReceived)
+                    }
+                    MysqlStateProgress::FieldListReceived => {
+                        let tx = if self.tx_id > 0 {
+                            self.get_tx_mut(self.tx_id - 1)
+                        } else {
+                            None
+                        };
+                        if let Some(tx) = tx {
+                            tx.complete = true;
+                        }
+                        Some(MysqlStateProgress::FieldListResponseReceived)
+                    }
+                    MysqlStateProgress::StmtExecReceived
+                    | MysqlStateProgress::StmtExecResponseContinue => {
+                        let tx = if self.tx_id > 0 {
+                            self.get_tx_mut(self.tx_id - 1)
+                        } else {
+                            None
+                        };
+                        if let Some(tx) = tx {
+                            tx.complete = true;
+                        }
+                        Some(MysqlStateProgress::StmtExecResponseReceived)
+                    }
+                    MysqlStateProgress::StmtResetReceived => {
+                        Some(MysqlStateProgress::StmtResetResponseReceived)
+                    }
+                    MysqlStateProgress::ChangeUserReceived => {
+                        let tx = if self.tx_id > 0 {
+                            self.get_tx_mut(self.tx_id - 1)
+                        } else {
+                            None
+                        };
+                        if let Some(tx) = tx {
+                            tx.complete = true;
+                        }
+                        Some(MysqlStateProgress::Finished)
+                    }
+                    MysqlStateProgress::StmtFetchReceived
+                    | MysqlStateProgress::StmtFetchResponseContinue => {
+                        let tx = if self.tx_id > 0 {
+                            self.get_tx_mut(self.tx_id - 1)
+                        } else {
+                            None
+                        };
+                        if let Some(tx) = tx {
+                            tx.complete = true;
+                        }
+                        Some(MysqlStateProgress::StmtFetchResponseReceived)
+                    }
+                    _ => None,
+                },
+                MysqlResponsePacket::Ok {
+                    rows,
+                    flags: _,
+                    warnings: _,
+                } => match self.state_progress {
+                    MysqlStateProgress::Auth => {
+                        self.handshake_done = true;
+                        Some(MysqlStateProgress::AuthFinished)
+                    }
+                    MysqlStateProgress::CommandReceived => {
+                        let tx = if self.tx_id > 0 {
+                            self.get_tx_mut(self.tx_id - 1)
+                        } else {
+                            None
+                        };
+                        if let Some(tx) = tx {
+                            tx.affected_rows = Some(rows);
+                            tx.complete = true;
+                        }
+                        Some(MysqlStateProgress::CommandResponseReceived)
+                    }
+                    MysqlStateProgress::StmtExecReceived => {
+                        let tx = if self.tx_id > 0 {
+                            self.get_tx_mut(self.tx_id - 1)
+                        } else {
+                            None
+                        };
+                        if let Some(tx) = tx {
+                            tx.affected_rows = Some(rows);
+                            tx.complete = true;
+                        }
+                        Some(MysqlStateProgress::StmtExecResponseReceived)
+                    }
+                    MysqlStateProgress::ChangeUserReceived => {
+                        Some(MysqlStateProgress::ChangeUserResponseReceived)
+                    }
+                    MysqlStateProgress::StmtResetReceived => {
+                        Some(MysqlStateProgress::StmtResetResponseReceived)
+                    }
+                    MysqlStateProgress::TextResulsetContinue => {
+                        let tx = if self.tx_id > 0 {
+                            self.get_tx_mut(self.tx_id - 1)
+                        } else {
+                            None
+                        };
+                        if let Some(tx) = tx {
+                            tx.complete = true;
+                        }
+                        Some(MysqlStateProgress::CommandResponseReceived)
+                    }
+                    MysqlStateProgress::StmtExecResponseContinue => {
+                        let prepare_stmt = self.prepare_stmt.take();
+                        if self.tx_id > 0 {
+                            let tx = self.get_tx_mut(self.tx_id - 1);
+                            if let Some(tx) = tx {
+                                if let Some(mut prepare_stmt) = prepare_stmt {
+                                    let rows = prepare_stmt.rows.take();
+                                    if let Some(rows) = rows {
+                                        tx.rows = Some(
+                                            rows.into_iter()
+                                                .map(|row| match row {
+                                                    MysqlResultBinarySetRow::Err => String::new(),
+                                                    MysqlResultBinarySetRow::Text(text) => text,
+                                                })
+                                                .collect::<Vec<String>>(),
+                                        );
+                                    }
+
+                                    tx.complete = true;
+                                }
+                            }
+                        }
+                        Some(MysqlStateProgress::StmtExecResponseReceived)
+                    }
+                    MysqlStateProgress::StmtFetchResponseContinue => {
+                        Some(MysqlStateProgress::StmtFetchResponseReceived)
+                    }
+                    _ => None,
+                },
+                MysqlResponsePacket::ResultSet {
+                    n_cols: _,
+                    columns: _,
+                    rows,
+                    multi_statement,
+                } => {
+                    let tx = if self.tx_id > 0 {
+                        self.get_tx_mut(self.tx_id - 1)
+                    } else {
+                        None
+                    };
+                    if !rows.is_empty() {
+                        let mut rows = rows.into_iter().map(|row| row.texts.join(",")).collect();
+                        if let Some(tx) = tx {
+                            if !multi_statement {
+                                tx.rows = Some(rows);
+                                Some(MysqlStateProgress::CommandResponseReceived)
+                            } else {
+                                // MultiStatement
+                                if let Some(state_rows) = tx.rows.as_mut() {
+                                    state_rows.append(&mut rows);
+                                } else {
+                                    tx.rows = Some(rows);
+                                }
+
+                                Some(MysqlStateProgress::TextResulsetContinue)
+                            }
+                        } else {
+                            Some(MysqlStateProgress::Finished)
+                        }
+                    } else {
+                        Some(MysqlStateProgress::CommandResponseReceived)
+                    }
+                }
+                MysqlResponsePacket::StmtPrepare {
+                    statement_id,
+                    num_params,
+                    params,
+                    ..
+                } => {
+                    if let Some(prepare_stmt) = &mut self.prepare_stmt {
+                        prepare_stmt.set_statement_id(statement_id);
+                        prepare_stmt.set_param_cnt(num_params);
+                        if let Some(params) = params {
+                            prepare_stmt.set_param_types(params);
+                        }
+                    }
+
+                    Some(MysqlStateProgress::StmtPrepareResponseReceived)
+                }
+                MysqlResponsePacket::StmtFetch => {
+                    Some(MysqlStateProgress::StmtFetchResponseReceived)
+                }
+                MysqlResponsePacket::BinaryResultSet {
+                    n_cols: _,
+                    rows,
+                    multi_resultset,
+                } => {
+                    if self.state_progress == MysqlStateProgress::StmtFetchReceived
+                        || self.state_progress == MysqlStateProgress::StmtFetchResponseContinue
+                    {
+                        return Some(MysqlStateProgress::StmtFetchResponseContinue);
+                    }
+
+                    if !rows.is_empty() {
+                        if !multi_resultset {
+                            let tx = if self.tx_id > 0 {
+                                self.get_tx_mut(self.tx_id - 1)
+                            } else {
+                                None
+                            };
+                            if let Some(tx) = tx {
+                                tx.rows = Some(
+                                    rows.into_iter()
+                                        .map(|row| match row {
+                                            MysqlResultBinarySetRow::Err => String::new(),
+                                            MysqlResultBinarySetRow::Text(text) => text,
+                                        })
+                                        .collect::<Vec<String>>(),
+                                );
+                                tx.complete = true;
+                            }
+
+                            Some(MysqlStateProgress::StmtExecResponseReceived)
+                        } else {
+                            // MultiResulset
+                            if let Some(prepare_stmt) = &mut self.prepare_stmt {
+                                prepare_stmt.add_rows(rows);
+                            }
+
+                            Some(MysqlStateProgress::StmtExecResponseContinue)
+                        }
+                    } else {
+                        Some(MysqlStateProgress::StmtExecResponseReceived)
+                    }
+                }
+                _ => None,
+            },
+        }
+    }
+
+    fn state_based_resp_parsing(
+        state: MysqlStateProgress, i: &[u8], client_flags: u32,
+    ) -> IResult<&[u8], MysqlBEMessage> {
+        match state {
+            MysqlStateProgress::Init => {
+                let (i, resp) = parse_handshake_request(i)?;
+                Ok((i, MysqlBEMessage::HandshakeRequest(resp)))
+            }
+
+            MysqlStateProgress::Auth => {
+                let (i, resp) = parse_auth_responsev2(i)?;
+                Ok((i, MysqlBEMessage::Response(resp)))
+            }
+
+            MysqlStateProgress::StmtPrepareReceived => {
+                let (i, resp) = parse_stmt_prepare_response(i, client_flags)?;
+                Ok((i, MysqlBEMessage::Response(resp)))
+            }
+
+            MysqlStateProgress::StmtExecReceived | MysqlStateProgress::StmtExecResponseContinue => {
+                let (i, resp) = parse_stmt_execute_response(i, client_flags)?;
+                Ok((i, MysqlBEMessage::Response(resp)))
+            }
+
+            MysqlStateProgress::StmtFetchReceived
+            | MysqlStateProgress::StmtFetchResponseContinue => {
+                let (i, resp) = parse_stmt_fetch_response(i, client_flags)?;
+                Ok((i, MysqlBEMessage::Response(resp)))
+            }
+
+            MysqlStateProgress::FieldListReceived => {
+                let (i, resp) = parse_field_list_response(i)?;
+                Ok((i, MysqlBEMessage::Response(resp)))
+            }
+            MysqlStateProgress::StatisticsReceived => {
+                let (i, resp) = parse_statistics_response(i)?;
+                Ok((i, MysqlBEMessage::Response(resp)))
+            }
+            MysqlStateProgress::ChangeUserReceived => {
+                let (i, resp) = parse_change_user_response(i)?;
+                Ok((i, MysqlBEMessage::Response(resp)))
+            }
+
+            _ => {
+                let (i, resp) = parse_response(i, client_flags)?;
+                Ok((i, MysqlBEMessage::Response(resp)))
+            }
+        }
+    }
+
+    fn invalid_state_resp(&self) -> bool {
+        use MysqlStateProgress::*;
+        self.state_progress == CommandResponseReceived
+            || self.state_progress == StmtCloseReceived
+            || self.state_progress == StmtPrepareResponseReceived
+            || self.state_progress == StmtExecResponseReceived
+    }
+
+    pub fn parse_response(&mut self, i: &[u8]) -> AppLayerResult {
         // We're not interested in empty responses.
-        if input.is_empty() {
+        if i.is_empty() {
             return AppLayerResult::ok();
         }
 
         if self.response_gap {
-            if probe(input).is_err() {
-                // The parser now needs to decide what to do as we are not in sync.
-                // For this mysql, we'll just try again next time.
+            if probe(i).is_err() {
+                SCLogDebug!("Suricata interprets there's a gap in the response");
                 return AppLayerResult::ok();
             }
 
-            // It looks like we're in sync with a message header, clear gap
-            // state and keep parsing.
+            // It seems we're in sync with a message header, clear gap state and keep parsing.
             self.response_gap = false;
         }
-        let mut start = input;
-        while !start.is_empty() {
-            match parser::parse_message(start) {
-                Ok((rem, response)) => {
-                    start = rem;
 
-                    if let Some(tx) =  self.find_request() {
-                        tx.tx_data.updated_tc = true;
-                        tx.response = Some(response);
-                        SCLogNotice!("Found response for request:");
-                        SCLogNotice!("- Request: {:?}", tx.request);
-                        SCLogNotice!("- Response: {:?}", tx.response);
+        let mut start = i;
+
+        while !start.is_empty() {
+            if self.state_progress == MysqlStateProgress::Finished || self.invalid_state_resp() {
+                return AppLayerResult::ok();
+            }
+            if self.is_compressed() {
+                let zstd = self.zstd.unwrap_or_default();
+                let (rem, i) = match parse_compressed_packet(start, zstd) {
+                    Ok((rem, decompressed_packet)) => (rem, decompressed_packet.payload),
+                    Err(nom7::Err::Incomplete(_needed)) => {
+                        let consumed = i.len() - start.len();
+                        let needed_estimation = start.len() + 1;
+                        SCLogDebug!(
+                            "Needed: {:?}, estimated needed: {:?}",
+                            _needed,
+                            needed_estimation
+                        );
+                        return AppLayerResult::incomplete(
+                            consumed as u32,
+                            needed_estimation as u32,
+                        );
+                    }
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL compressed packet, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err
+                        );
+                        return AppLayerResult::err();
+                    }
+                };
+                start = rem;
+
+                match MysqlState::state_based_resp_parsing(
+                    self.state_progress,
+                    i.as_slice(),
+                    self.client_flags,
+                ) {
+                    Ok((_, response)) => {
+                        SCLogDebug!("Response is {:?}", &response);
+                        if let Some(state) = self.response_next_state(response) {
+                            self.state_progress = state;
+                        }
+                    }
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL response, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err,
+                        );
+                        return AppLayerResult::err();
                     }
                 }
-                Err(nom::Err::Incomplete(_)) => {
-                    let consumed = input.len() - start.len();
-                    let needed = start.len() + 1;
-                    return AppLayerResult::incomplete(consumed as u32, needed as u32);
-                }
-                Err(_) => {
-                    return AppLayerResult::err();
+            } else {
+                match MysqlState::state_based_resp_parsing(
+                    self.state_progress,
+                    start,
+                    self.client_flags,
+                ) {
+                    Ok((rem, response)) => {
+                        start = rem;
+
+                        SCLogDebug!("Response is {:?}", &response);
+                        if let Some(state) = self.response_next_state(response) {
+                            self.state_progress = state;
+                        }
+                    }
+                    Err(nom7::Err::Incomplete(_needed)) => {
+                        let consumed = i.len() - start.len();
+                        let needed_estimation = start.len() + 1;
+                        SCLogDebug!(
+                            "Needed: {:?}, estimated needed: {:?}, start is {:?}",
+                            _needed,
+                            needed_estimation,
+                            &start
+                        );
+                        return AppLayerResult::incomplete(
+                            consumed as u32,
+                            needed_estimation as u32,
+                        );
+                    }
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL response, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err,
+                        );
+                        return AppLayerResult::err();
+                    }
                 }
             }
         }
 
-        // All input was fully consumed.
-        return AppLayerResult::ok();
+        // All Input was fully consumed.
+        AppLayerResult::ok()
     }
 
-    fn on_request_gap(&mut self, _size: u32) {
+    pub fn on_request_gap(&mut self, _size: u32) {
         self.request_gap = true;
     }
 
-    fn on_response_gap(&mut self, _size: u32) {
+    pub fn on_response_gap(&mut self, _size: u32) {
         self.response_gap = true;
     }
 }
 
-/// Probe for a valid header.
-///
-/// As this mysql protocol uses messages prefixed with the size
-/// as a string followed by a ':', we look at up to the first 10
-/// characters for that pattern.
-fn probe(input: &[u8]) -> nom::IResult<&[u8], ()> {
-    let size = std::cmp::min(10, input.len());
-    let (rem, prefix) = nom::bytes::complete::take(size)(input)?;
-    nom::sequence::terminated(
-        nom::bytes::complete::take_while1(nom::character::is_digit),
-        nom::bytes::complete::tag(":"),
-    )(prefix)?;
-    Ok((rem, ()))
+/// Probe for a valid mysql message
+fn probe(i: &[u8]) -> IResult<&[u8], ()> {
+    let (i, _) = parse_packet_header(i)?;
+    Ok((i, ()))
 }
 
-// C exports.
+// C exports
 
 /// C entry point for a probing parser.
-unsafe extern "C" fn rs_mysql_probing_parser(
+#[no_mangle]
+pub unsafe extern "C" fn rs_mysql_probing_ts(
     _flow: *const Flow, _direction: u8, input: *const u8, input_len: u32, _rdir: *mut u8,
 ) -> AppProto {
-    // Need at least 2 bytes.
-    if input_len > 1 && !input.is_null() {
-        let slice = build_slice!(input, input_len as usize);
-        if probe(slice).is_ok() {
-            return ALPROTO_MYSQL;
+    if input_len >= 1 && !input.is_null() {
+        let slice: &[u8] = build_slice!(input, input_len as usize);
+        match parse_handshake_capabilities(slice) {
+            Ok((_, client_flags)) => {
+                if client_flags & CLIENT_SSL != 0 {
+                    match parse_handshake_ssl_request(slice) {
+                        Ok(_) => return ALPROTO_MYSQL,
+                        Err(nom7::Err::Incomplete(_)) => return ALPROTO_UNKNOWN,
+                        Err(err) => {
+                            SCLogError!("failed to probe ssl request {:?}", err);
+                            return ALPROTO_FAILED;
+                        }
+                    }
+                } else {
+                    match parse_handshake_response(slice) {
+                        Ok(_) => return ALPROTO_MYSQL,
+                        Err(nom7::Err::Incomplete(_)) => return ALPROTO_UNKNOWN,
+                        Err(err) => {
+                            SCLogError!("failed to probe handshake response {:?}", err);
+                            return ALPROTO_FAILED;
+                        }
+                    }
+                }
+            }
+            Err(nom7::Err::Incomplete(_)) => return ALPROTO_UNKNOWN,
+            Err(_err) => {
+                SCLogDebug!("failed to probe request {:?}", _err);
+                return ALPROTO_FAILED;
+            }
         }
     }
+
     return ALPROTO_UNKNOWN;
 }
 
-extern "C" fn rs_mysql_state_new(
-    _orig_state: *mut c_void, _orig_proto: AppProto,
-) -> *mut c_void {
+#[no_mangle]
+pub unsafe extern "C" fn rs_mysql_probing_tc(
+    _flow: *const Flow, _direction: u8, input: *const u8, input_len: u32, _rdir: *mut u8,
+) -> AppProto {
+    if input_len >= 1 && !input.is_null() {
+        let slice: &[u8] = build_slice!(input, input_len as usize);
+        match parse_handshake_request(slice) {
+            Ok(_) => return ALPROTO_MYSQL,
+            Err(nom7::Err::Incomplete(_)) => return ALPROTO_UNKNOWN,
+            Err(_err) => {
+                SCLogDebug!("failed to probe response {:?}", _err);
+                return ALPROTO_FAILED;
+            }
+        }
+    }
+
+    return ALPROTO_UNKNOWN;
+}
+
+#[no_mangle]
+pub extern "C" fn rs_mysql_state_new(
+    _orig_state: *mut std::os::raw::c_void, _orig_proto: AppProto,
+) -> *mut std::os::raw::c_void {
     let state = MysqlState::new();
     let boxed = Box::new(state);
-    return Box::into_raw(boxed) as *mut c_void;
+    return Box::into_raw(boxed) as *mut _;
 }
 
-unsafe extern "C" fn rs_mysql_state_free(state: *mut c_void) {
-    std::mem::drop(Box::from_raw(state as *mut MysqlState));
+#[no_mangle]
+pub extern "C" fn rs_mysql_state_free(state: *mut std::os::raw::c_void) {
+    std::mem::drop(unsafe { Box::from_raw(state as *mut MysqlState) });
 }
 
-unsafe extern "C" fn rs_mysql_state_tx_free(state: *mut c_void, tx_id: u64) {
-    let state = cast_pointer!(state, MysqlState);
-    state.free_tx(tx_id);
+#[no_mangle]
+pub extern "C" fn rs_mysql_state_tx_free(state: *mut std::os::raw::c_void, tx_id: u64) {
+    let state_safe: &mut MysqlState;
+    unsafe {
+        state_safe = cast_pointer!(state, MysqlState);
+    }
+    state_safe.free_tx(tx_id);
 }
 
-unsafe extern "C" fn rs_mysql_parse_request(
-    _flow: *const Flow, state: *mut c_void, pstate: *mut c_void, stream_slice: StreamSlice,
-    _data: *const c_void,
+#[no_mangle]
+pub unsafe extern "C" fn rs_mysql_parse_request(
+    flow: *const Flow, state: *mut std::os::raw::c_void, pstate: *mut std::os::raw::c_void,
+    stream_slice: StreamSlice, _data: *const std::os::raw::c_void,
 ) -> AppLayerResult {
-    let eof = AppLayerParserStateIssetFlag(pstate, APP_LAYER_PARSER_EOF_TS) > 0;
-
-    if eof {
-        // If needed, handle EOF, or pass it into the parser.
-        return AppLayerResult::ok();
+    if stream_slice.is_empty() {
+        if AppLayerParserStateIssetFlag(pstate, APP_LAYER_PARSER_EOF_TS) > 0 {
+            SCLogDebug!(" Caracal reached `eof`");
+            return AppLayerResult::ok();
+        } else {
+            return AppLayerResult::err();
+        }
     }
 
-    let state = cast_pointer!(state, MysqlState);
+    let state_safe: &mut MysqlState = cast_pointer!(state, MysqlState);
 
     if stream_slice.is_gap() {
-        // Here we have a gap signaled by the input being null, but a greater
-        // than 0 input_len which provides the size of the gap.
-        state.on_request_gap(stream_slice.gap_size());
-        AppLayerResult::ok()
+        state_safe.on_request_gap(stream_slice.gap_size());
     } else {
-        let buf = stream_slice.as_slice();
-        state.parse_request(buf)
+        return state_safe.parse_request(flow, stream_slice.as_slice());
     }
+    AppLayerResult::ok()
 }
 
-unsafe extern "C" fn rs_mysql_parse_response(
-    _flow: *const Flow, state: *mut c_void, pstate: *mut c_void, stream_slice: StreamSlice,
-    _data: *const c_void,
+#[no_mangle]
+pub unsafe extern "C" fn rs_mysql_parse_response(
+    _flow: *const Flow, state: *mut std::os::raw::c_void, pstate: *mut std::os::raw::c_void,
+    stream_slice: StreamSlice, _data: *const std::os::raw::c_void,
 ) -> AppLayerResult {
-    let _eof = AppLayerParserStateIssetFlag(pstate, APP_LAYER_PARSER_EOF_TC) > 0;
-    let state = cast_pointer!(state, MysqlState);
+    if stream_slice.is_empty() {
+        if AppLayerParserStateIssetFlag(pstate, APP_LAYER_PARSER_EOF_TC) > 0 {
+            return AppLayerResult::ok();
+        } else {
+            return AppLayerResult::err();
+        }
+    }
+
+    let state_safe: &mut MysqlState = cast_pointer!(state, MysqlState);
 
     if stream_slice.is_gap() {
-        // Here we have a gap signaled by the input being null, but a greater
-        // than 0 input_len which provides the size of the gap.
-        state.on_response_gap(stream_slice.gap_size());
-        AppLayerResult::ok()
+        state_safe.on_response_gap(stream_slice.gap_size());
     } else {
-        let buf = stream_slice.as_slice();
-        state.parse_response(buf)
+        return state_safe.parse_response(stream_slice.as_slice());
     }
+    AppLayerResult::ok()
 }
 
-unsafe extern "C" fn rs_mysql_state_get_tx(state: *mut c_void, tx_id: u64) -> *mut c_void {
-    let state = cast_pointer!(state, MysqlState);
-    match state.get_tx(tx_id) {
+#[no_mangle]
+pub extern "C" fn rs_mysql_state_get_tx_count(state: *mut std::os::raw::c_void) -> u64 {
+    let state_safe: &mut MysqlState;
+    unsafe {
+        state_safe = cast_pointer!(state, MysqlState);
+    }
+    return state_safe.tx_id;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rs_mysql_state_get_tx(
+    state: *mut std::os::raw::c_void, tx_id: u64,
+) -> *mut std::os::raw::c_void {
+    let state_safe: &mut MysqlState = cast_pointer!(state, MysqlState);
+    match state_safe.get_tx(tx_id) {
         Some(tx) => {
             return tx as *const _ as *mut _;
         }
@@ -333,52 +1293,13 @@ unsafe extern "C" fn rs_mysql_state_get_tx(state: *mut c_void, tx_id: u64) -> *m
     }
 }
 
-unsafe extern "C" fn rs_mysql_state_get_tx_count(state: *mut c_void) -> u64 {
-    let state = cast_pointer!(state, MysqlState);
-    return state.tx_id;
-}
-
-unsafe extern "C" fn rs_mysql_tx_get_alstate_progress(tx: *mut c_void, _direction: u8) -> c_int {
+#[no_mangle]
+pub unsafe extern "C" fn rs_mysql_tx_get_alstate_progress(
+    tx: *mut std::os::raw::c_void, _direction: u8,
+) -> std::os::raw::c_int {
     let tx = cast_pointer!(tx, MysqlTransaction);
-
-    // Transaction is done if we have a response.
-    if tx.response.is_some() {
+    if tx.complete {
         return 1;
-    }
-    return 0;
-}
-
-/// Get the request buffer for a transaction from C.
-///
-/// No required for parsing, but an example function for retrieving a
-/// pointer to the request buffer from C for detection.
-#[no_mangle]
-pub unsafe extern "C" fn rs_mysql_get_request_buffer(
-    tx: *mut c_void, buf: *mut *const u8, len: *mut u32,
-) -> u8 {
-    let tx = cast_pointer!(tx, MysqlTransaction);
-    if let Some(ref request) = tx.request {
-        if !request.is_empty() {
-            *len = request.len() as u32;
-            *buf = request.as_ptr();
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/// Get the response buffer for a transaction from C.
-#[no_mangle]
-pub unsafe extern "C" fn rs_mysql_get_response_buffer(
-    tx: *mut c_void, buf: *mut *const u8, len: *mut u32,
-) -> u8 {
-    let tx = cast_pointer!(tx, MysqlTransaction);
-    if let Some(ref response) = tx.response {
-        if !response.is_empty() {
-            *len = response.len() as u32;
-            *buf = response.as_ptr();
-            return 1;
-        }
     }
     return 0;
 }
@@ -391,14 +1312,14 @@ const PARSER_NAME: &[u8] = b"mysql\0";
 
 #[no_mangle]
 pub unsafe extern "C" fn rs_mysql_register_parser() {
-
-    let default_port = CString::new("[7000]").unwrap();
+    let default_port = CString::new("[3306]").unwrap();
+    let mut stream_depth = MYSQL_CONFIG_DEFAULT_STREAM_DEPTH;
     let parser = RustParser {
-        name: PARSER_NAME.as_ptr() as *const c_char,
+        name: PARSER_NAME.as_ptr() as *const std::os::raw::c_char,
         default_port: default_port.as_ptr(),
         ipproto: IPPROTO_TCP,
-        probe_ts: Some(rs_mysql_probing_parser),
-        probe_tc: Some(rs_mysql_probing_parser),
+        probe_ts: Some(rs_mysql_probing_ts),
+        probe_tc: Some(rs_mysql_probing_tc),
         min_depth: 0,
         max_depth: 16,
         state_new: rs_mysql_state_new,
@@ -417,13 +1338,12 @@ pub unsafe extern "C" fn rs_mysql_register_parser() {
         localstorage_free: None,
         get_tx_files: None,
         get_tx_iterator: Some(
-            applayer::state_get_tx_iterator::<MysqlState, MysqlTransaction>,
+            crate::applayer::state_get_tx_iterator::<MysqlState, MysqlTransaction>,
         ),
         get_tx_data: rs_mysql_get_tx_data,
         get_state_data: rs_mysql_get_state_data,
         apply_tx_config: None,
         flags: APP_LAYER_PARSER_OPT_ACCEPT_GAPS,
-        truncate: None,
         get_frame_id_by_name: None,
         get_frame_name_by_id: None,
     };
@@ -436,6 +1356,19 @@ pub unsafe extern "C" fn rs_mysql_register_parser() {
         if AppLayerParserConfParserEnabled(ip_proto_str.as_ptr(), parser.name) != 0 {
             let _ = AppLayerRegisterParser(&parser, alproto);
         }
+        SCLogDebug!("Rust mysql parser registered.");
+        let retval = conf_get("app-layer.protocols.mysql.stream-depth");
+        if let Some(val) = retval {
+            match get_memval(val) {
+                Ok(retval) => {
+                    stream_depth = retval as u32;
+                }
+                Err(_) => {
+                    SCLogError!("Invalid depth value");
+                }
+            }
+            AppLayerParserSetStreamDepth(IPPROTO_TCP, ALPROTO_MYSQL, stream_depth)
+        }
         if let Some(val) = conf_get("app-layer.protocols.mysql.max-tx") {
             if let Ok(v) = val.parse::<usize>() {
                 MYSQL_MAX_TX = v;
@@ -443,79 +1376,8 @@ pub unsafe extern "C" fn rs_mysql_register_parser() {
                 SCLogError!("Invalid value for mysql.max-tx");
             }
         }
-        SCLogNotice!("Rust mysql parser registered.");
+        AppLayerParserRegisterLogger(IPPROTO_TCP, ALPROTO_MYSQL);
     } else {
-        SCLogNotice!("Protocol detector and parser disabled for MYSQL.");
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_probe() {
-        assert!(probe(b"1").is_err());
-        assert!(probe(b"1:").is_ok());
-        assert!(probe(b"123456789:").is_ok());
-        assert!(probe(b"0123456789:").is_err());
-    }
-
-    #[test]
-    fn test_incomplete() {
-        let mut state = MysqlState::new();
-        let buf = b"5:Hello3:bye";
-
-        let r = state.parse_request(&buf[0..0]);
-        assert_eq!(
-            r,
-            AppLayerResult {
-                status: 0,
-                consumed: 0,
-                needed: 0
-            }
-        );
-
-        let r = state.parse_request(&buf[0..1]);
-        assert_eq!(
-            r,
-            AppLayerResult {
-                status: 1,
-                consumed: 0,
-                needed: 2
-            }
-        );
-
-        let r = state.parse_request(&buf[0..2]);
-        assert_eq!(
-            r,
-            AppLayerResult {
-                status: 1,
-                consumed: 0,
-                needed: 3
-            }
-        );
-
-        // This is the first message and only the first message.
-        let r = state.parse_request(&buf[0..7]);
-        assert_eq!(
-            r,
-            AppLayerResult {
-                status: 0,
-                consumed: 0,
-                needed: 0
-            }
-        );
-
-        // The first message and a portion of the second.
-        let r = state.parse_request(&buf[0..9]);
-        assert_eq!(
-            r,
-            AppLayerResult {
-                status: 1,
-                consumed: 7,
-                needed: 3
-            }
-        );
+        SCLogDebug!("Protocol detector and parser disabled for MYSQL.");
     }
 }
