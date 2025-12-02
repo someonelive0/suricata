@@ -1,3 +1,69 @@
+7.0.13 -- 2025-11-05
+
+Security #8067: lua: stack overflow from unbounded stack allocation in LuaPushStringBuffer (7.0.x backport)(HIGH - CVE 2025-64344)
+Security #8062: eve/http: stack overflow on large file transfers (7.0.x backport)(MODERATE - CVE 2025-64331)
+Security #8061: util/swf: stack overflow on larger compressed data  (7.0.x backport)(LOW - CVE 2025-64332)
+Security #8060: eve/http: stack overflow from big content type (7.0.x backport)(HIGH - CVE 2025-64333)
+Security #8029: eve/alert: heap buffer overflow on verdict (7.0.x backport)(MODERATE - CVE 2025-64330)
+Security #8080: unix-socket: use after free if client command is too long (7.0.x backport)
+Bug #8013: dpdk: compile warning ‘rte_eth_bond_members_get’ is deprecated (7.0.x backport)
+Bug #7999: detect: replace keyword leaks memory (7.0.x backport)
+Bug #7993: http2: wrong parsing of go away frames error code (7.0.x backport)
+Bug #7977: dpdk: fix the CPU exclude logic (7.0.x backport)
+Bug #7962: mime: incorrect decoding of quoted-printable text attachments (7.0.x backport)
+Bug #7924: output/json: invalid IKE logs (7.0.x backport)
+Bug #7906: eve/alert: incorrect verdict with pass + alert rule (7.0.x backport)
+Task #6522: github/actions: add DPDK 23.11 build (7.0.x backport)
+
+7.0.12 -- 2025-09-15
+
+Security #7852: tcp: syn resend with different seq leads to detection bypasss (7.0.x backport)(HIGH - CVE 2025-59147)
+Bug #7898: unix-socket: memory leak when client disconnects during rule reload (7.0.x backport)
+Bug #7883: tcp: SYN/ACK dropped when client does not support timestamps (7.0.x backport)
+Bug #7878: rust: build with RUSTC and CARGO variables fails (7.0.x backport)
+Bug #7876: tcp: possible bypass with TCP ssn reuse (7.0.x backport)
+Bug #7874: alert-debug: DNS Query triggers alert but no output in alert-debug.log (7.0.x backport)
+Bug #7872: dpdk: mbuf reference leak on a NULL packet
+Bug #7866: detect/integers: u8 prefilter does not support all modes (7.0.x backport)
+Bug #7862: http: dissection anomaly on `Content-Encoding: identity` (7.0.x backport)
+Bug #7837: util-byte: bad usage of StringParse function return codes (7.0.x backport)
+Bug #7826: decoder/pppoe: valid packets are getting dropped as decoder.ppp.unsup_proto (7.0.x backport)
+Bug #7823: community id computed wrong for tcp and ipv4 when src_ip == dest_ip   (7.0.x backport)
+Bug #7810: detect/dsize: uninitialized value from SigParseRequiredContentSize (7.0.x backport)
+Bug #7777: decode/ipv6: set packet flow in ip-in-ip (7.0.x backport)
+Bug #7726: decode/ipv4: missing ip-in-ip case handling (7.0.x backport)
+Bug #7582: http: multipart post only decodes first file
+Bug #7574: dns: malformed request data event from macOS to Active Directory DNS server
+Bug #7522: detect/ip-only: false positive alerts on pseudo packets ending a one direction flow (7.0.x backport)
+Bug #6934: UBSAN: null pointer passed as argument to memcpy in unit test
+Feature #7623: flow/output: log triggered exception policy (7.0.x backport)
+Feature #6804: ci: add test for non-bundled htp
+Feature #6509: stats: exception policy counters (7.0.x backport)
+Task #7776: decode/ipv4: add stats counters for ipv4/ipv6 over ipv4 (7.0.x backport)
+Documentation #7778: doc/exceptions: review 'inspection' terminology (7.0.x backport)
+Documentation #6582: userguide: add description for missing EVE krb fields (7.0.x backport)
+
+7.0.11 -- 2025-07-08
+
+Security #7766: libhtp-c: memory leak with lzma(HIGH - CVE 2025-53537)
+Security #7659: http2: global tx (stream id 0) may open file and never close it (7.0.x backport)(HIGH - CVE 2025-53538)
+Bug #7779: mpm/ac: error "Just ran out of space in the queue" (7.0.x backport)
+Bug #7748: byte_extract: issue with saved 'name' in distance keyword (7.0.x backport)
+Bug #7736: brotli: old crate version has integer underflow (7.0.x backport)
+Bug #7731: dcerpc: uint16 overflow (rust debug assertion) (7.0.x backport)
+Bug #7716: snmp: probing parser returns ALPROTO_FAILED instead of ALPROTO_UNKNOWN if slice.len() < 4 (7.0.x backport)
+Bug #7690: datasets: set type IP can't set IPv4 (7.0.x backport)
+Bug #7688: flow: non-TCP protocol timeout handling leads to missing flows (7.0.x backport)
+Bug #7682: flow: race condition at shutdown leads to duplicate flows (7.0.x backport)
+Bug #7670: http: lack of setting updated_ts leads to detection delay (7.0.x backport)
+Bug #7663: ips: deconflict pass flow and drop packet rules (7.0.x backport)
+Bug #7661: pcap: continuous file reading fails on an empty directory (7.0.x backport)
+Bug #7652: rust: warnings with rustc 1.86
+Bug #7610: http: reachable assertion when memcap reached during rule reload
+Bug #7375: dpdk: iface-copy should not be mandatory (7.0.x backport)
+Bug #7293: CI: clang-format does not work for main-7.0.x branch (7.0.x backport)
+Optimization #7781: mpm/ac-ks: reduce stack usage (7.0.x backport)
+
 7.0.10 -- 2025-03-25
 
 Bug #7619: af-packet: setting bpf fails (7.0.x backport)

@@ -210,22 +210,10 @@ static void EveAddPacketVars(const Packet *p, JsonBuilder *js_vars)
                 PrintStringsToBuffer(keybuf, &offset,
                         sizeof(keybuf),
                         pv->key, pv->key_len);
-                uint32_t len = pv->value_len;
-                uint8_t printable_buf[len + 1];
-                offset = 0;
-                PrintStringsToBuffer(printable_buf, &offset,
-                        sizeof(printable_buf),
-                        pv->value, pv->value_len);
-                jb_set_string(js_vars, (char *)keybuf, (char *)printable_buf);
+                SCJbSetPrintAsciiString(js_vars, (char *)keybuf, pv->value, pv->value_len);
             } else {
                 const char *varname = VarNameStoreLookupById(pv->id, VAR_TYPE_PKT_VAR);
-                uint32_t len = pv->value_len;
-                uint8_t printable_buf[len + 1];
-                uint32_t offset = 0;
-                PrintStringsToBuffer(printable_buf, &offset,
-                        sizeof(printable_buf),
-                        pv->value, pv->value_len);
-                jb_set_string(js_vars, varname, (char *)printable_buf);
+                SCJbSetPrintAsciiString(js_vars, varname, pv->value, pv->value_len);
             }
             jb_close(js_vars);
         }
@@ -276,15 +264,9 @@ static void EveAddFlowVars(const Flow *f, JsonBuilder *js_root, JsonBuilder **js
                             break;
                     }
 
-                    uint32_t len = fv->data.fv_str.value_len;
-                    uint8_t printable_buf[len + 1];
-                    uint32_t offset = 0;
-                    PrintStringsToBuffer(printable_buf, &offset,
-                            sizeof(printable_buf),
-                            fv->data.fv_str.value, fv->data.fv_str.value_len);
-
                     jb_start_object(js_flowvars);
-                    jb_set_string(js_flowvars, varname, (char *)printable_buf);
+                    SCJbSetPrintAsciiString(
+                            js_flowvars, varname, fv->data.fv_str.value, fv->data.fv_str.value_len);
                     jb_close(js_flowvars);
                 }
             } else if (fv->datatype == FLOWVAR_TYPE_STR && fv->key != NULL) {
@@ -300,15 +282,9 @@ static void EveAddFlowVars(const Flow *f, JsonBuilder *js_root, JsonBuilder **js
                         sizeof(keybuf),
                         fv->key, fv->keylen);
 
-                uint32_t len = fv->data.fv_str.value_len;
-                uint8_t printable_buf[len + 1];
-                offset = 0;
-                PrintStringsToBuffer(printable_buf, &offset,
-                        sizeof(printable_buf),
-                        fv->data.fv_str.value, fv->data.fv_str.value_len);
-
                 jb_start_object(js_flowvars);
-                jb_set_string(js_flowvars, (const char *)keybuf, (char *)printable_buf);
+                SCJbSetPrintAsciiString(js_flowvars, (const char *)keybuf, fv->data.fv_str.value,
+                        fv->data.fv_str.value_len);
                 jb_close(js_flowvars);
             } else if (fv->datatype == FLOWVAR_TYPE_INT) {
                 const char *varname = VarNameStoreLookupById(fv->idx,
@@ -622,7 +598,7 @@ static bool CalculateCommunityFlowIdv4(const Flow *f,
     dp = htons(dp);
 
     ipv4.seed = htons(seed);
-    if (ntohl(src) < ntohl(dst) || (src == dst && sp < dp)) {
+    if (ntohl(src) < ntohl(dst) || (src == dst && ntohs(sp) < ntohs(dp))) {
         ipv4.src = src;
         ipv4.dst = dst;
         ipv4.sp = sp;
@@ -671,7 +647,7 @@ static bool CalculateCommunityFlowIdv6(const Flow *f,
 
     ipv6.seed = htons(seed);
     int cmp_r = memcmp(&f->src, &f->dst, sizeof(f->src));
-    if ((cmp_r < 0) || (cmp_r == 0 && sp < dp)) {
+    if ((cmp_r < 0) || (cmp_r == 0 && ntohs(sp) < ntohs(dp))) {
         memcpy(&ipv6.src, &f->src.addr_data32, 16);
         memcpy(&ipv6.dst, &f->dst.addr_data32, 16);
         ipv6.sp = sp;

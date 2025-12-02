@@ -380,6 +380,8 @@ void DetectContentFree(DetectEngineCtx *de_ctx, void *ptr)
     if (cd == NULL)
         SCReturn;
 
+    if (cd->replace)
+        SCFree(cd->replace);
     SpmDestroyCtx(cd->spm_ctx);
 
     SCFree(cd);
@@ -413,6 +415,8 @@ void SigParseRequiredContentSize(
 {
     int max_offset = 0, total_len = 0;
     bool first = true;
+    // define it first, and override it unless in DETECT_CONTENT_NEGATED edge case
+    *offset = 0;
     for (; sm != NULL; sm = sm->next) {
         if (sm->type != DETECT_CONTENT || sm->ctx == NULL) {
             continue;

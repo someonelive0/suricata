@@ -252,9 +252,10 @@ static void UnixClientFree(UnixClient *c)
 static void UnixCommandClose(UnixCommand  *this, int fd)
 {
     UnixClient *item;
+    UnixClient *safe = NULL;
     int found = 0;
 
-    TAILQ_FOREACH(item, &this->clients, next) {
+    TAILQ_FOREACH_SAFE (item, &this->clients, next, safe) {
         if (item->fd == fd) {
             found = 1;
             break;
@@ -519,7 +520,7 @@ static int UnixCommandExecute(UnixCommand * this, char *command, UnixClient *cli
     }
 
     if (UnixCommandSendJSONToClient(client, server_msg) != 0) {
-        goto error;
+        goto error_cmd;
     }
 
     json_decref(jsoncmd);
@@ -553,6 +554,7 @@ static void UnixCommandRun(UnixCommand * this, UnixClient *client)
             SCLogError("Command server: client command is too long, "
                        "disconnect him.");
             UnixCommandClose(this, client->fd);
+            return;
         }
         buffer[ret] = 0;
     } else {
@@ -574,6 +576,7 @@ static void UnixCommandRun(UnixCommand * this, UnixClient *client)
                 SCLogInfo("Command server: client command is too long, "
                         "disconnect him.");
                 UnixCommandClose(this, client->fd);
+                return;
             }
             if (buffer[ret - 1] == '\n') {
                 buffer[ret-1] = 0;

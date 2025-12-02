@@ -56,7 +56,7 @@ pub enum HTTP2ConnectionState {
 
 const HTTP2_FRAME_HEADER_LEN: usize = 9;
 const HTTP2_MAGIC_LEN: usize = 24;
-const HTTP2_FRAME_GOAWAY_LEN: usize = 4;
+const HTTP2_FRAME_GOAWAY_LEN: usize = 8;
 const HTTP2_FRAME_RSTSTREAM_LEN: usize = 4;
 const HTTP2_FRAME_PRIORITY_LEN: usize = 5;
 const HTTP2_FRAME_WINDOWUPDATE_LEN: usize = 4;
@@ -409,6 +409,7 @@ pub enum HTTP2Event {
     AuthorityHostMismatch,
     UserinfoInUri,
     ReassemblyLimitReached,
+    DataStreamZero,
 }
 
 pub struct HTTP2DynTable {
@@ -601,10 +602,7 @@ impl HTTP2State {
         self.tx_id += 1;
         tx.tx_id = self.tx_id;
         tx.state = HTTP2TransactionState::HTTP2StateGlobal;
-        tx.tx_data.update_file_flags(self.state_data.file_flags);
-        // TODO can this tx hold files?
-        tx.tx_data.file_tx = STREAM_TOSERVER|STREAM_TOCLIENT; // might hold files in both directions
-        tx.update_file_flags(tx.tx_data.file_flags);
+        // a global tx (stream id 0) does not hold files cf RFC 9113 section 5.1.1
         self.transactions.push_back(tx);
         return self.transactions.back_mut().unwrap();
     }
@@ -622,6 +620,8 @@ impl HTTP2State {
                     tx_old.set_event(HTTP2Event::TooManyStreams);
                     // use a distinct state, even if we do not log it
                     tx_old.state = HTTP2TransactionState::HTTP2StateTodrop;
+                    tx_old.tx_data.updated_tc = true;
+                    tx_old.tx_data.updated_ts = true;
                 }
                 return None;
             }
@@ -1078,7 +1078,9 @@ impl HTTP2State {
                             data: txdata,
                         });
                     }
-                    if ftype == parser::HTTP2FrameType::Data as u8 {
+                    if ftype == parser::HTTP2FrameType::Data as u8 && sid == 0 {
+                        tx.tx_data.set_event(HTTP2Event::DataStreamZero as u8);
+                    } else if ftype == parser::HTTP2FrameType::Data as u8 && sid > 0 {
                         match unsafe { SURICATA_HTTP2_FILE_CONFIG } {
                             Some(sfcm) => {
                                 //borrow checker forbids to reuse directly tx
